@@ -24,6 +24,11 @@ from meerk40t.ruida.rdjob import (
     MEM_CURRENT_U,
     RDJob)
 
+# Maximum data bytes per packet, not counting the 2-byte UDP checksum. This
+# matches LibLaserCut. It is conservative: Ruida doesn't document the real
+# limit.
+MAX_PACKET_DATA = 998
+
 
 class RuidaController:
     """
@@ -81,16 +86,25 @@ class RuidaController:
         self._send_thread.start()
 
     def divide_data_into_queue(self):
+        '''Split the job buffer into chunks of at most MAX_PACKET_DATA bytes.
+
+        A command is never split across chunks. A command larger than the limit
+        is sent alone in an oversized chunk.'''
         last = 0
         total = 0
         data = self.job.buffer
         for i, command in enumerate(data):
-            total += len(command)
-            if total > 1000:
+            size = len(command)
+            if total and total + size > MAX_PACKET_DATA:
                 self._send_queue.append(self.job.get_contents(last, i))
                 last = i
                 total = 0
-        if last != len(data):
+            if size > MAX_PACKET_DATA:
+                self.events(
+                    f"WARNING: Command of {size} bytes exceeds the "
+                    f"{MAX_PACKET_DATA} byte packet limit; sending it alone.")
+            total += size
+        if last < len(data):
             self._send_queue.append(self.job.get_contents(last))
 
     def resume_monitor(self):

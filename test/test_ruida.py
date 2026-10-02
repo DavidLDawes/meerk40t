@@ -44,3 +44,81 @@ class TestRuidaSession(unittest.TestCase):
             transport.writes, [struct.pack(">H", 0x01 + 0x02 + 0x03) + b"\x01\x02\x03"]
         )
         self.assertTrue(self.session._responding)
+
+
+class TestRuidaDivideData(unittest.TestCase):
+    """RuidaController.divide_data_into_queue splits jobs into packets."""
+
+    def make_controller(self, commands):
+        from meerk40t.ruida.controller import RuidaController
+        from test.ruida_helpers import Recorder
+
+        # Skip __init__: it starts a status thread which polls the service.
+        controller = RuidaController.__new__(RuidaController)
+        controller.job = type("Job", (), {})()
+        controller.job.buffer = list(commands)
+        controller.job.get_contents = lambda first=None, last=None: b"".join(
+            controller.job.buffer[first:last]
+        )
+        controller.events = Recorder()
+        controller._send_queue = []
+        return controller
+
+    def test_chunks_within_limit(self):
+        from meerk40t.ruida.controller import MAX_PACKET_DATA
+
+        # 7 byte commands do not divide 998 evenly, so splits land mid-stream.
+        commands = [bytes([i % 256]) * 7 for i in range(1000)]
+        controller = self.make_controller(commands)
+        controller.divide_data_into_queue()
+        self.assertGreater(len(controller._send_queue), 1)
+        for chunk in controller._send_queue:
+            self.assertLessEqual(len(chunk), MAX_PACKET_DATA)
+
+    def test_chunks_rejoin_to_original(self):
+        commands = [bytes([i % 256]) * (1 + i % 40) for i in range(500)]
+        controller = self.make_controller(commands)
+        controller.divide_data_into_queue()
+        self.assertEqual(b"".join(controller._send_queue), b"".join(commands))
+
+    def test_command_boundaries_kept(self):
+        commands = [bytes([i % 256]) * (1 + i % 40) for i in range(500)]
+        controller = self.make_controller(commands)
+        controller.divide_data_into_queue()
+        boundaries = set()
+        position = 0
+        for command in commands:
+            boundaries.add(position)
+            position += len(command)
+        boundaries.add(position)
+        position = 0
+        for chunk in controller._send_queue:
+            self.assertIn(position, boundaries)
+            position += len(chunk)
+        self.assertEqual(position, sum(len(c) for c in commands))
+
+    def test_oversized_command_sent_alone(self):
+        from meerk40t.ruida.controller import MAX_PACKET_DATA
+
+        big = b"\xAB" * (MAX_PACKET_DATA + 50)
+        commands = [b"\x01" * 10, b"\x02" * 10, big, b"\x03" * 10]
+        controller = self.make_controller(commands)
+        controller.divide_data_into_queue()
+        self.assertEqual(
+            controller._send_queue, [b"\x01" * 10 + b"\x02" * 10, big, b"\x03" * 10]
+        )
+        self.assertEqual(len(controller.events.calls), 1)
+        self.assertIn("WARNING", controller.events.calls[0][0])
+
+    def test_empty_buffer_queues_nothing(self):
+        controller = self.make_controller([])
+        controller.divide_data_into_queue()
+        self.assertEqual(controller._send_queue, [])
+
+    def test_exact_fit_is_one_chunk(self):
+        from meerk40t.ruida.controller import MAX_PACKET_DATA
+
+        commands = [b"\x01" * (MAX_PACKET_DATA // 2)] * 2
+        controller = self.make_controller(commands)
+        controller.divide_data_into_queue()
+        self.assertEqual(len(controller._send_queue), 1)
