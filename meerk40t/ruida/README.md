@@ -18,13 +18,23 @@ device.
 
 ## Overview
 
-The Ruida module attempts to provide comprehensive compatibility with Ruida DSP controllers and RDWorks software ecosystem. Unlike direct hardware drivers, this module primarily functions as:
+The Ruida module is a MeerK40t device driver for Ruida DSP controllers. It
+provides:
+
+- **Direct control** of a Ruida controller over UDP (Ethernet) or USB/serial:
+  sending jobs, jogging, homing (including the physical home), pause, resume
+  and abort, focus Z, and polling the controller for machine status, head
+  position, bed size and card ID. The status is shown in the Ruida Controller
+  window and the status bar. This has been tested only as described in the
+  note at the top of this file.
+- **.rd file loader**: Parser for .rd (Ruida) files.
+- **Protocol emulator and bridge** (`ruidacontrol`): Simulates a Ruida
+  controller so that other software can send jobs to MeerK40t, which are then
+  run on the active laser device.
 
 **Untested**
-- **File Format Handler**: Complete parser for .rd (Ruida) files
-- **Protocol Emulator**: Simulates Ruida controllers for third-party software compatibility
-- **Bridge Interface**: Translates between Ruida protocol and MeerK40t's internal cutcode
-- **Network Server**: Provides UDP/TCP endpoints for external software connections
+- The .rd file loader and the emulator/bridge (`ruidacontrol`) have not been
+  verified against current software. Treat them as untested.
 
 ## Architecture
 
@@ -45,11 +55,19 @@ The Ruida module follows a multi-layered architecture designed for protocol comp
 - **Real-time Processing**: Processes jog commands, status requests, and file transfers
 - **Coordinate Mapping**: Translates between Ruida and MeerK40t coordinate systems
 
-#### RuidaControl (`controller.py`)
+#### RuidaControl (`control.py`)
 - **Server Management**: Controls UDP server instances for different ports
 - **Traffic Routing**: Implements man-in-the-middle capabilities
 - **Bridge Protocol**: Supports LB2RD (Lightburn to Ruida) bridging
 - **Device Integration**: Routes commands to active MeerK40t laser devices
+
+#### RuidaController (`controller.py`)
+- **Job Sending**: Splits a job into packets (see "Packet Size and Retries"
+  below) and sends them in a background thread
+- **Status Monitor**: Polls the controller for machine status, head position,
+  bed size and card ID, and updates the UI
+- **Timeouts**: Switches between the normal and gross comms timeouts (the gross
+  timeout is used for the physical home, when the controller goes silent)
 
 ### Device Layer (`device.py`)
 - **Service Integration**: Registers as MeerK40t device service
@@ -58,15 +76,17 @@ The Ruida module follows a multi-layered architecture designed for protocol comp
 - **Connection Multiplexing**: Supports multiple connection types (UDP and USB/Serial)
 
 ### Driver Layer (`driver.py`)
-- **Cutcode Translation**: Converts Ruida commands to MeerK40t cutcode
+- **Cutcode Translation**: Converts MeerK40t cutcode into Ruida commands
 - **Plot Planning**: Integrates with MeerK40t's plot planning system
-- **Real-time Control**: Handles jog movements and status updates
+- **Real-time Control**: Handles jog, home, pause, resume and abort
 - **Power/Speed Control**: Manages laser parameters during operation
 
 ### Session Layer (`ruidasession.py`)
 - **Session**: Communication session management.
 - **Connect/Disconnect**:Automatically connects and reconnects to the Ruida
   controller using either the UDP or USB/Serial transports.
+- **Handshake**: A thread sends each queued packet and waits for the ACK (UDP)
+  and for reply data where one is expected. See "Packet Size and Retries".
 
 ### Transport Layer (`ruidatransport.py` and `udp_transport.py` or `usb_transport.py`)
 - **Interface**: Communication device specific connection management.
@@ -159,12 +179,14 @@ The parser handles the complete Ruida command set including:
 - **40207**: Laser jog channel (when bridging)
 
 #### Connection Types
-- **UDPConnection**: Primary network interface for external software
-- **SerialConnection**: Direct serial connection to Ruida controllers
+- **UDPTransport** (`udp_transport.py`): Ethernet. Sends to port 50200 on the
+  controller and listens on port 40200.
+- **USBTransport** (`usb_transport.py`): USB/serial. No checksum is added and the
+  controller sends no ACKs.
 
-**Unsupported by Ruida controllers.**
-- **TCPConnection**: Alternative TCP-based communication
-- **MockConnection**: Development and testing interface
+`udp_connection.py`, `serial_connection.py`, `tcp_connection.py` and
+`mock_connection.py` are older modules which no other module imports. TCP is
+not supported by Ruida controllers.
 
 ### Bridge Protocols
 
@@ -211,12 +233,13 @@ loader.load(kernel, service, "design.rd")
 
 #### Device Registration
 ```python
-# Register Ruida device (marked as incomplete)
+# Register the Ruida device (see plugin.py). The low priority keeps it
+# below the better tested devices in the device list.
 kernel.register("provider/device/ruida", RuidaDevice)
 kernel.register("dev_info/ruida-beta", {
     "provider": "provider/device/ruida",
-    "friendly_name": "K50/K60-CO2-Laser (Ruida-Controller) (INCOMPLETE)",
-    "priority": -1,  # Low priority due to incomplete status
+    "friendly_name": _("K50/K60-CO2-Laser (Ruida-Controller)"),
+    "priority": -1,
 })
 ```
 
@@ -241,6 +264,31 @@ Example Commands:
 \x80\x00 [x_coord]         # X-axis move
 ```
 
+### Packet Format
+- **UDP**: Each packet is a 2-byte big-endian checksum (the sum of the swizzled
+  data bytes & 0xFFFF) followed by the swizzled data. The controller replies
+  with a one-byte status: ACK, NAK (resend) or ENQ. Longer replies are data.
+- **USB/serial**: The swizzled data is sent without a checksum and the
+  controller sends no ACKs. The session reads a memory value to check that the
+  controller is responding.
+
+### Packet Size and Retries
+- **Packet size limit**: A job is divided into packets of at most 998 data
+  bytes (`MAX_PACKET_DATA` in `controller.py`), not counting the 2-byte UDP
+  checksum. Commands are never split across packets. A single command larger
+  than the limit is sent alone and a warning is logged to the events channel.
+  Ruida does not document its packet size limit. 998 is the value used by
+  LibLaserCut and is conservative, so treat it as unverified.
+- **NAK limit**: If the controller answers a packet with a NAK the session
+  resends it, up to 3 times (`_max_nak_resends` in `ruidasession.py`). After
+  that the packet is dropped, "Too many NAKs; packet dropped." is logged, comms
+  is treated as failed and the session reconnects before sending the next packet.
+- **Timeouts**: The normal ACK timeout is about 1 second (4 tries of 0.25
+  seconds). While doing a physical home, when the controller goes silent, a 40
+  second gross timeout is used. A timeout counts as a comms failure and triggers
+  a reconnect. Whether other long operations (such as a keypad home) need the
+  gross timeout is not known.
+
 ### Coordinate Systems
 - **Ruida Coordinates**: Device-specific units (typically 1/1000 mm)
 - **MeerK40t Units**: Internal micron-based coordinate system
@@ -263,8 +311,12 @@ Different Ruida controller variants use different magic keys:
 
 ### Testing
 ```bash
-# Run Ruida-specific tests
-python -m unittest test_ruida.py
+# Run Ruida-specific tests (from the repository root). These use a fake
+# service and transport and never touch a real socket, serial port or laser.
+python -m unittest test.test_ruida test.test_ruida_session -v
+
+# Run the full suite, as CI does
+python -m unittest discover test -v
 
 # Test file loading
 python -c "from meerk40t.ruida.loader import RDLoader; print('RD loader available')"
@@ -277,29 +329,36 @@ python -c "from meerk40t.ruida.loader import RDLoader; print('RD loader availabl
 
 ## Compatibility
 
-### Supported Software
-- **RDWorks**: Full compatibility via UDP emulation
-- **Lightburn**: Supported through bridge protocols
-- **Ruida Android App**: Network connectivity
-- **Third-party Ruida software**: Generic protocol support
+### Tested
+- **RDC6442S controller with a Monport MP-570 CO2 laser, on Fedora Linux**:
+  direct control over UDP and USB. This is the only hardware setup tested.
 
-### Hardware Compatibility
-- **Ruida DSP Controllers**: K-Series (K50, K60) and others
-- **Network-enabled lasers**: Any device supporting Ruida protocol
-- **USB/Serial Ruida devices**: Through connection abstraction layer
+### Untested
+Compatibility with the following is intended but has not been tested:
+- **RDWorks** via the emulator (`ruidacontrol`)
+- **Lightburn** via the emulator and bridge protocols
+- **Ruida Android App**
+- **Other Ruida controllers** and other K-Series lasers (K50, K60)
+- **Windows** and macOS
 
 ## Limitations
 
 ### Current Status
-- **INCOMPLETE**: Marked as beta/incomplete in device registration
-- **Emulation Only**: Does not provide direct hardware control
-- **File Format Focus**: Primarily designed for file compatibility
-- **Bridge Functionality**: Main use case is software compatibility
+- **Beta**: Registered with a low priority in the device list and tested on one
+  hardware setup only (see the notes at the top of this file).
+- **Direct control**: Job sending, jog, home, pause/resume/abort and status
+  polling are implemented for UDP and USB/serial.
+- **Emulator and bridge**: Untested, see above.
 
 ### Known Issues
-- Direct hardware control not implemented
+- Flip X must be enabled in the Ruida Configuration window and raster layers
+  need an overscan of 0 (see the notes at the top of this file).
+- The packet size limit (998 data bytes) is not documented by Ruida and is
+  unverified on hardware.
 - Some advanced Ruida features may not be fully supported
 - Real-time performance depends on network latency
+- Long silences from the controller (for example a keypad home) may be treated
+  as a comms failure and cause a temporary reconnect. This is not confirmed.
 
 ## Troubleshooting
 
@@ -321,7 +380,7 @@ python -c "from meerk40t.ruida.loader import RDLoader; print('RD loader availabl
 ## Future Development
 
 ### Planned Features
-- Direct hardware control implementation
+- Testing on more controllers and on Windows
 - Enhanced real-time performance
 - Additional Ruida controller variant support
 - Extended bridge protocol capabilities

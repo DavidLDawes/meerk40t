@@ -129,7 +129,7 @@ laser was connected, and none may be used without the user's say-so).
 
 ---
 
-## 4. [ ] Correct the out-of-date README (`meerk40t/ruida/README.md`)
+## 4. [x] Correct the out-of-date README (`meerk40t/ruida/README.md`)
 
 **Problem:** the opening note correctly says direct control has been tested on
 an RDC6442S. But "Overview", "Limitations" (lines 291 onwards) and "Known
