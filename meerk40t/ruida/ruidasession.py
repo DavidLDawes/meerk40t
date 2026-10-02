@@ -73,6 +73,7 @@ class RuidaSession:
         self._handshake_thread = None
         self._timeout = 0.25
         self._tries = 4
+        self._max_nak_resends = 3 # Resends of one packet after NAKs.
         self._is_shutdown = True
         self._shutdown = False
         if self._handshake_thread is None:
@@ -350,6 +351,7 @@ class RuidaSession:
 
                 # ACK_PENDING
                 _tries = self._tries
+                _nak_resends = 0
                 while self._ack_pending:
                     try:
                         _data = self.transport.read(1)
@@ -375,12 +377,21 @@ class RuidaSession:
                             self._ack_pending = False
                             self.acks += 1
                         elif _ack == NAK:
+                            self.naks += 1
+                            if _nak_resends >= self._max_nak_resends:
+                                # The controller keeps rejecting this packet.
+                                # Give up on it rather than resend forever.
+                                self._responding = False
+                                self._ack_pending = False
+                                self._reply_pending = False
+                                self.events('Too many NAKs; packet dropped.')
+                                break
+                            _nak_resends += 1
                             try:
                                 self.transport.write(_packet)
                             except TransportError:
                                 self._responding = False
                                 self._ack_pending = False
-                            self.naks += 1
                         elif _ack == ENQ:
                             self.enqs += 1
                     else:
